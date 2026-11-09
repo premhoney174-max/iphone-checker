@@ -1,0 +1,164 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p proj/app/src/main/java/com/starmobiles/iphonecheck
+          cd proj
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "StarIphoneChecker"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+            namespace = "com.starmobiles.iphonecheck"
+            compileSdk = 34
+            defaultConfig {
+              applicationId = "com.starmobiles.iphonecheck"
+              minSdk = 26
+              targetSdk = 34
+              versionCode = 1
+              versionName = "0.1"
+            }
+            compileOptions {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-feature android:name="android.hardware.usb.host" android:required="true"/>
+            <application android:label="STAR iPhone Checker" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/starmobiles/iphonecheck/MainActivity.kt <<'EOF'
+          package com.starmobiles.iphonecheck
+
+          import android.app.Activity
+          import android.app.PendingIntent
+          import android.content.*
+          import android.hardware.usb.*
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private val PERM = "com.starmobiles.iphonecheck.USB_PERM"
+              private lateinit var out: TextView
+              private lateinit var usb: UsbManager
+
+              private val rx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) { scan() }
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  usb = getSystemService(Context.USB_SERVICE) as UsbManager
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 64, 32, 32)
+                  }
+                  val btn = Button(this).apply {
+                      text = "Scan iPhone"
+                      setOnClickListener { scan() }
+                  }
+                  out = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
+                  root.addView(btn)
+                  root.addView(ScrollView(this).apply { addView(out) })
+                  setContentView(root)
+                  val f = IntentFilter().apply {
+                      addAction(PERM)
+                      addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, f, Context.RECEIVER_NOT_EXPORTED)
+                  else registerReceiver(rx, f)
+              }
+
+              override fun onResume() { super.onResume(); scan() }
+              override fun onDestroy() { super.onDestroy(); unregisterReceiver(rx) }
+
+              private fun hex(v: Int) = String.format("0x%04X", v)
+
+              private fun scan() {
+                  val list = usb.deviceList.values.filter { it.vendorId == 0x05AC }
+                  if (list.isEmpty()) {
+                      out.text = "No iPhone found.\n\n1. Connect cable\n2. Unlock iPhone\n3. Tap Trust if asked\n4. Press Scan"
+                      return
+                  }
+                  val sb = StringBuilder()
+                  for (d in list) {
+                      if (!usb.hasPermission(d)) {
+                          val i = Intent(PERM).setPackage(packageName)
+                          val pi = PendingIntent.getBroadcast(this, 0, i, PendingIntent.FLAG_MUTABLE)
+                          usb.requestPermission(d, pi)
+                          sb.append("Allow USB access on the popup, then it will refresh.\n")
+                          continue
+                      }
+                      val mode = when (d.productId) {
+                          0x12A8 -> "Normal mode (OK)"
+                          0x1281 -> "Recovery mode"
+                          0x1227 -> "DFU mode"
+                          0x1222 -> "Restore mode"
+                          else -> "Other mode"
+                      }
+                      var mux = false
+                      for (c in 0 until d.configurationCount) {
+                          val cfg = d.getConfiguration(c)
+                          for (k in 0 until cfg.interfaceCount) {
+                              val itf = cfg.getInterface(k)
+                              if (itf.interfaceClass == 255 && itf.interfaceSubclass == 254) mux = true
+                          }
+                      }
+                      val serial = try { d.serialNumber } catch (e: Exception) { null }
+                      sb.append("iPhone FOUND\n\n")
+                      sb.append("Product: ").append(d.productName ?: "N/A").append("\n")
+                      sb.append("Maker: ").append(d.manufacturerName ?: "N/A").append("\n")
+                      sb.append("Vendor ID: ").append(hex(d.vendorId)).append("\n")
+                      sb.append("Product ID: ").append(hex(d.productId)).append("\n")
+                      sb.append("Mode: ").append(mode).append("\n")
+                      sb.append("USB serial: ").append(serial ?: "N/A").append("\n")
+                      sb.append("Configurations: ").append(d.configurationCount).append("\n")
+                      sb.append("usbmux channel: ").append(if (mux) "FOUND (good)" else "NOT FOUND").append("\n")
+                  }
+                  out.text = sb.toString()
+              }
+          }
+          EOF
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StarIphoneChecker-APK
+          path: proj/app/build/outputs/apk/debug/app-debug.apk

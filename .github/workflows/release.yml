@@ -1,0 +1,22 @@
+name: Release APK
+on:
+  workflow_run:
+    workflows: ["Build APK"]
+    types: [completed]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: StarIphoneChecker-APK
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "apk-${{ github.event.workflow_run.run_number }}" app-debug.apk --repo "${{ github.repository }}" --title "APK ${{ github.event.workflow_run.run_number }}" --notes "STAR iPhone Checker"

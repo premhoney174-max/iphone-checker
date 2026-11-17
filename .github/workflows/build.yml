@@ -39,8 +39,8 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 1
-              versionName = "0.1"
+              versionCode = 2
+              versionName = "0.2"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -72,11 +72,168 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.widget.*
+          import java.io.ByteArrayOutputStream
+          import java.nio.ByteBuffer
+          import org.w3c.dom.Element
+
+          class Mux(private val c: UsbDeviceConnection, private val ein: UsbEndpoint, private val eout: UsbEndpoint) {
+              private var tx = 0
+              private var rx = 0xFFFF
+              private var seq = 0
+              private var ack = 0
+              private var dport = 0
+              private val acc = ByteArrayOutputStream()
+
+              class In(val flags: Int, val seq: Int, val data: ByteArray)
+
+              private fun raw(b: ByteArray) = c.bulkTransfer(eout, b, b.size, 3000) >= 0
+
+              private fun rd(): ByteArray? {
+                  val b = ByteArray(65536)
+                  val n = c.bulkTransfer(ein, b, b.size, 2000)
+                  return if (n > 0) b.copyOf(n) else null
+              }
+
+              private fun pkt(proto: Int, body: ByteArray): ByteArray {
+                  val b = ByteBuffer.allocate(16 + body.size)
+                  b.putInt(proto); b.putInt(16 + body.size); b.putInt(0xFEEDFACE.toInt())
+                  b.putShort(tx.toShort()); b.putShort(rx.toShort()); b.put(body)
+                  tx = (tx + 1) and 0xFFFF
+                  return b.array()
+              }
+
+              private fun tcp(flags: Int, data: ByteArray = ByteArray(0)): ByteArray {
+                  val b = ByteBuffer.allocate(20 + data.size)
+                  b.putShort(49152.toShort()); b.putShort(dport.toShort())
+                  b.putInt(seq); b.putInt(ack)
+                  b.put(0x50.toByte()); b.put(flags.toByte())
+                  b.putShort(512.toShort()); b.putShort(0); b.putShort(0)
+                  b.put(data)
+                  return pkt(6, b.array())
+              }
+
+              private fun recv(): In? {
+                  repeat(8) {
+                      val r = rd() ?: return null
+                      if (r.size < 16) return@repeat
+                      val bb = ByteBuffer.wrap(r)
+                      val proto = bb.getInt(0)
+                      val len = minOf(bb.getInt(4), r.size)
+                      rx = bb.getShort(12).toInt() and 0xFFFF
+                      if (proto == 6 && len >= 36) {
+                          val off = ((r[28].toInt() and 0xF0) shr 4) * 4
+                          if (16 + off <= len) return In(r[29].toInt() and 0xFF, bb.getInt(20), r.copyOfRange(16 + off, len))
+                      }
+                  }
+                  return null
+              }
+
+              fun start(): Boolean {
+                  val v = ByteBuffer.allocate(20)
+                  v.putInt(0); v.putInt(20); v.putInt(2); v.putInt(0); v.putInt(0)
+                  if (!raw(v.array())) return false
+                  val r = rd() ?: return false
+                  if (r.size < 12 || ByteBuffer.wrap(r).getInt(8) < 2) return false
+                  return raw(pkt(2, byteArrayOf(7)))
+              }
+
+              fun open(port: Int): Boolean {
+                  dport = port; seq = 0; ack = 0
+                  if (!raw(tcp(2))) return false
+                  seq = 1
+                  repeat(6) {
+                      val t = recv() ?: return false
+                      if ((t.flags and 0x12) == 0x12) { ack = t.seq + 1; return raw(tcp(0x10)) }
+                      if ((t.flags and 4) != 0) return false
+                  }
+                  return false
+              }
+
+              private fun send(d: ByteArray): Boolean {
+                  val ok = raw(tcp(0x10, d))
+                  seq += d.size
+                  return ok
+              }
+
+              private fun readMsg(): ByteArray? {
+                  repeat(30) {
+                      val a = acc.toByteArray()
+                      if (a.size >= 4) {
+                          val len = ByteBuffer.wrap(a).getInt()
+                          if (len >= 0 && a.size >= 4 + len) {
+                              acc.reset(); acc.write(a, 4 + len, a.size - 4 - len)
+                              return a.copyOfRange(4, 4 + len)
+                          }
+                      }
+                      val t = recv() ?: return null
+                      if ((t.flags and 4) != 0) return null
+                      if (t.data.isNotEmpty()) { acc.write(t.data); ack += t.data.size; raw(tcp(0x10)) }
+                  }
+                  return null
+              }
+
+              fun ask(body: String): String? {
+                  val x = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>STAR</string>" + body + "</dict></plist>").toByteArray()
+                  val b = ByteBuffer.allocate(4 + x.size)
+                  b.putInt(x.size); b.put(x)
+                  if (!send(b.array())) return null
+                  return readMsg()?.toString(Charsets.UTF_8)
+              }
+          }
+
+          fun kv(d: Element): List<Pair<String, Element>> {
+              val out = ArrayList<Pair<String, Element>>()
+              var key: String? = null
+              val ch = d.childNodes
+              for (i in 0 until ch.length) {
+                  val n = ch.item(i)
+                  if (n !is Element) continue
+                  if (n.tagName == "key") key = n.textContent
+                  else if (key != null) { out.add(Pair(key, n)); key = null }
+              }
+              return out
+          }
+
+          fun parse(x: String): List<Pair<String, Element>> {
+              val s = x.replace(Regex("<!DOCTYPE[^>]*>"), "")
+              val doc = javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(s.byteInputStream())
+              return kv(doc.documentElement.getElementsByTagName("dict").item(0) as Element)
+          }
+
+          fun show(e: Element): String = when (e.tagName) {
+              "true" -> "Yes"
+              "false" -> "No"
+              "dict", "array", "data" -> "(" + e.tagName + ")"
+              else -> e.textContent
+          }
+
+          val MODELS = mapOf(
+              "iPhone12,1" to "iPhone 11", "iPhone12,3" to "iPhone 11 Pro", "iPhone12,5" to "iPhone 11 Pro Max",
+              "iPhone12,8" to "iPhone SE (2nd gen)",
+              "iPhone13,1" to "iPhone 12 mini", "iPhone13,2" to "iPhone 12", "iPhone13,3" to "iPhone 12 Pro",
+              "iPhone13,4" to "iPhone 12 Pro Max",
+              "iPhone14,4" to "iPhone 13 mini", "iPhone14,5" to "iPhone 13", "iPhone14,2" to "iPhone 13 Pro",
+              "iPhone14,3" to "iPhone 13 Pro Max", "iPhone14,6" to "iPhone SE (3rd gen)",
+              "iPhone14,7" to "iPhone 14", "iPhone14,8" to "iPhone 14 Plus", "iPhone15,2" to "iPhone 14 Pro",
+              "iPhone15,3" to "iPhone 14 Pro Max",
+              "iPhone15,4" to "iPhone 15", "iPhone15,5" to "iPhone 15 Plus", "iPhone16,1" to "iPhone 15 Pro",
+              "iPhone16,2" to "iPhone 15 Pro Max",
+              "iPhone17,3" to "iPhone 16", "iPhone17,4" to "iPhone 16 Plus", "iPhone17,1" to "iPhone 16 Pro",
+              "iPhone17,2" to "iPhone 16 Pro Max", "iPhone17,5" to "iPhone 16e"
+          )
+
+          val WANTED = listOf(
+              "ProductVersion" to "iOS version", "BuildVersion" to "Build", "DeviceName" to "Name",
+              "HardwareModel" to "Board", "ModelNumber" to "Model number", "RegionInfo" to "Region",
+              "SerialNumber" to "Serial", "UniqueDeviceID" to "UDID", "ActivationState" to "Activation",
+              "InternationalMobileEquipmentIdentity" to "IMEI", "PasswordProtected" to "Passcode set"
+          )
 
           class MainActivity : Activity() {
               private val PERM = "com.starmobiles.iphonecheck.USB_PERM"
               private lateinit var out: TextView
               private lateinit var usb: UsbManager
+              @Volatile private var busy = false
 
               private val rx = object : BroadcastReceiver() {
                   override fun onReceive(c: Context, i: Intent) { scan() }
@@ -105,53 +262,91 @@ jobs:
                   else registerReceiver(rx, f)
               }
 
-              override fun onResume() { super.onResume(); scan() }
               override fun onDestroy() { super.onDestroy(); unregisterReceiver(rx) }
 
-              private fun hex(v: Int) = String.format("0x%04X", v)
+              private fun openMux(d: UsbDevice): Mux? {
+                  for (ci in 0 until d.configurationCount) {
+                      val cfg = d.getConfiguration(ci)
+                      for (k in 0 until cfg.interfaceCount) {
+                          val itf = cfg.getInterface(k)
+                          if (itf.interfaceClass != 255 || itf.interfaceSubclass != 254 || itf.interfaceProtocol != 2) continue
+                          val conn = usb.openDevice(d) ?: return null
+                          if (!conn.claimInterface(itf, true)) {
+                              conn.setConfiguration(cfg)
+                              if (!conn.claimInterface(itf, true)) continue
+                          }
+                          var i: UsbEndpoint? = null
+                          var o: UsbEndpoint? = null
+                          for (e in 0 until itf.endpointCount) {
+                              val ep = itf.getEndpoint(e)
+                              if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                                  if (ep.direction == UsbConstants.USB_DIR_IN) i = ep else o = ep
+                              }
+                          }
+                          if (i != null && o != null) return Mux(conn, i, o)
+                      }
+                  }
+                  return null
+              }
+
+              private fun query(d: UsbDevice): String {
+                  val mux = openMux(d) ?: return "Could not open the USB channel. Unplug, replug, unlock iPhone and scan again."
+                  if (!mux.start()) return "usbmux handshake failed. Unplug, replug, unlock iPhone and scan again."
+                  if (!mux.open(62078)) return "iPhone info service did not answer. Unlock iPhone and scan again."
+                  val rows = LinkedHashMap<String, String>()
+                  var err = ""
+                  val all = mux.ask("<key>Request</key><string>GetValue</string>")
+                  if (all != null) {
+                      try {
+                          val top = parse(all)
+                          val v = top.firstOrNull { it.first == "Value" }?.second
+                          if (v != null && v.tagName == "dict") for ((k, e) in kv(v)) rows[k] = show(e)
+                          top.firstOrNull { it.first == "Error" }?.let { err = show(it.second) }
+                      } catch (e: Exception) { err = "parse error" }
+                  }
+                  if (rows.size < 3) {
+                      for (k in listOf("ProductType", "ProductVersion", "BuildVersion", "DeviceName", "UniqueDeviceID", "SerialNumber", "ActivationState", "ModelNumber", "RegionInfo", "HardwareModel")) {
+                          val r = mux.ask("<key>Request</key><string>GetValue</string><key>Key</key><string>" + k + "</string>") ?: break
+                          try {
+                              val t = parse(r)
+                              val v = t.firstOrNull { it.first == "Value" }?.second
+                              if (v != null) rows[k] = show(v)
+                              t.firstOrNull { it.first == "Error" }?.let { err = show(it.second) }
+                          } catch (e: Exception) { }
+                      }
+                  }
+                  if (rows.isEmpty()) return "No data received. iPhone said: " + (err.ifEmpty { "nothing" }) + "\nUnlock iPhone, tap Trust if asked, scan again."
+                  val sb = StringBuilder()
+                  val pt = rows["ProductType"]
+                  sb.append("MODEL: ").append(MODELS[pt] ?: "Unknown").append("  (").append(pt ?: "N/A").append(")\n")
+                  for ((k, label) in WANTED) rows[k]?.let { sb.append(label).append(": ").append(it).append("\n") }
+                  sb.append("\n--- Other values ---\n")
+                  val used = WANTED.map { it.first } + "ProductType"
+                  for ((k, v) in rows) if (k !in used && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
+                  if (err.isNotEmpty()) sb.append("\nNote: ").append(err).append("\n")
+                  return sb.toString()
+              }
 
               private fun scan() {
+                  if (busy) return
                   val list = usb.deviceList.values.filter { it.vendorId == 0x05AC }
                   if (list.isEmpty()) {
                       out.text = "No iPhone found.\n\n1. Connect cable\n2. Unlock iPhone\n3. Tap Trust if asked\n4. Press Scan"
                       return
                   }
-                  val sb = StringBuilder()
-                  for (d in list) {
-                      if (!usb.hasPermission(d)) {
-                          val i = Intent(PERM).setPackage(packageName)
-                          val pi = PendingIntent.getBroadcast(this, 0, i, PendingIntent.FLAG_MUTABLE)
-                          usb.requestPermission(d, pi)
-                          sb.append("Allow USB access on the popup, then it will refresh.\n")
-                          continue
-                      }
-                      val mode = when (d.productId) {
-                          0x12A8 -> "Normal mode (OK)"
-                          0x1281 -> "Recovery mode"
-                          0x1227 -> "DFU mode"
-                          0x1222 -> "Restore mode"
-                          else -> "Other mode"
-                      }
-                      var mux = false
-                      for (c in 0 until d.configurationCount) {
-                          val cfg = d.getConfiguration(c)
-                          for (k in 0 until cfg.interfaceCount) {
-                              val itf = cfg.getInterface(k)
-                              if (itf.interfaceClass == 255 && itf.interfaceSubclass == 254) mux = true
-                          }
-                      }
-                      val serial = try { d.serialNumber } catch (e: Exception) { null }
-                      sb.append("iPhone FOUND\n\n")
-                      sb.append("Product: ").append(d.productName ?: "N/A").append("\n")
-                      sb.append("Maker: ").append(d.manufacturerName ?: "N/A").append("\n")
-                      sb.append("Vendor ID: ").append(hex(d.vendorId)).append("\n")
-                      sb.append("Product ID: ").append(hex(d.productId)).append("\n")
-                      sb.append("Mode: ").append(mode).append("\n")
-                      sb.append("USB serial: ").append(serial ?: "N/A").append("\n")
-                      sb.append("Configurations: ").append(d.configurationCount).append("\n")
-                      sb.append("usbmux channel: ").append(if (mux) "FOUND (good)" else "NOT FOUND").append("\n")
+                  val d = list[0]
+                  if (!usb.hasPermission(d)) {
+                      val pi = PendingIntent.getBroadcast(this, 0, Intent(PERM).setPackage(packageName), PendingIntent.FLAG_MUTABLE)
+                      usb.requestPermission(d, pi)
+                      out.text = "Allow USB access on the popup."
+                      return
                   }
-                  out.text = sb.toString()
+                  busy = true
+                  out.text = "Reading iPhone... keep it unlocked."
+                  Thread {
+                      val r = try { query(d) } catch (e: Exception) { "Error: " + e.toString() }
+                      runOnUiThread { out.text = r; busy = false }
+                  }.start()
               }
           }
           EOF

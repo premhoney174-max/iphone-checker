@@ -39,8 +39,8 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 2
-              versionName = "0.2"
+              versionCode = 3
+              versionName = "0.3"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -83,15 +83,29 @@ jobs:
               private var ack = 0
               private var dport = 0
               private val acc = ByteArrayOutputStream()
+              val dbg = StringBuilder()
+
+              private fun hex(b: ByteArray) = b.take(40).joinToString("") { "%02x".format(it) }
 
               class In(val flags: Int, val seq: Int, val data: ByteArray)
 
-              private fun raw(b: ByteArray) = c.bulkTransfer(eout, b, b.size, 3000) >= 0
+              private fun raw(b: ByteArray): Boolean {
+                  val n = c.bulkTransfer(eout, b, b.size, 3000)
+                  dbg.append("TX ").append(b.size).append(" -> ").append(n).append("\n")
+                  return n >= 0
+              }
 
-              private fun rd(): ByteArray? {
-                  val b = ByteArray(65536)
-                  val n = c.bulkTransfer(ein, b, b.size, 2000)
+              private fun rd(t: Int = 2000): ByteArray? {
+                  val b = ByteArray(16384)
+                  val n = c.bulkTransfer(ein, b, b.size, t)
+                  dbg.append("RX ").append(n)
+                  if (n > 0) dbg.append(" ").append(hex(b.copyOf(n)))
+                  dbg.append("\n")
                   return if (n > 0) b.copyOf(n) else null
+              }
+
+              private fun drain() {
+                  repeat(3) { if (rd(300) == null) return }
               }
 
               private fun pkt(proto: Int, body: ByteArray): ByteArray {
@@ -129,12 +143,18 @@ jobs:
               }
 
               fun start(): Boolean {
+                  drain()
                   val v = ByteBuffer.allocate(20)
                   v.putInt(0); v.putInt(20); v.putInt(2); v.putInt(0); v.putInt(0)
                   if (!raw(v.array())) return false
-                  val r = rd() ?: return false
-                  if (r.size < 12 || ByteBuffer.wrap(r).getInt(8) < 2) return false
-                  return raw(pkt(2, byteArrayOf(7)))
+                  repeat(4) {
+                      val r = rd() ?: return false
+                      if (r.size >= 12 && ByteBuffer.wrap(r).getInt(0) == 0) {
+                          if (ByteBuffer.wrap(r).getInt(8) < 2) return false
+                          return raw(pkt(2, byteArrayOf(7)))
+                      }
+                  }
+                  return false
               }
 
               fun open(port: Int): Boolean {
@@ -234,6 +254,7 @@ jobs:
               private lateinit var out: TextView
               private lateinit var usb: UsbManager
               @Volatile private var busy = false
+              private var info = ""
 
               private val rx = object : BroadcastReceiver() {
                   override fun onReceive(c: Context, i: Intent) { scan() }
@@ -283,7 +304,10 @@ jobs:
                                   if (ep.direction == UsbConstants.USB_DIR_IN) i = ep else o = ep
                               }
                           }
-                          if (i != null && o != null) return Mux(conn, i, o)
+                          if (i != null && o != null) {
+                              info = "cfg " + cfg.id + " itf " + itf.id + " in " + i.address + "/" + i.maxPacketSize + " out " + o.address + "/" + o.maxPacketSize
+                              return Mux(conn, i, o)
+                          }
                       }
                   }
                   return null
@@ -291,8 +315,8 @@ jobs:
 
               private fun query(d: UsbDevice): String {
                   val mux = openMux(d) ?: return "Could not open the USB channel. Unplug, replug, unlock iPhone and scan again."
-                  if (!mux.start()) return "usbmux handshake failed. Unplug, replug, unlock iPhone and scan again."
-                  if (!mux.open(62078)) return "iPhone info service did not answer. Unlock iPhone and scan again."
+                  if (!mux.start()) return "usbmux handshake failed.\n" + info + "\n" + mux.dbg
+                  if (!mux.open(62078)) return "iPhone info service did not answer.\n" + info + "\n" + mux.dbg
                   val rows = LinkedHashMap<String, String>()
                   var err = ""
                   val all = mux.ask("<key>Request</key><string>GetValue</string>")
@@ -315,7 +339,7 @@ jobs:
                           } catch (e: Exception) { }
                       }
                   }
-                  if (rows.isEmpty()) return "No data received. iPhone said: " + (err.ifEmpty { "nothing" }) + "\nUnlock iPhone, tap Trust if asked, scan again."
+                  if (rows.isEmpty()) return "No data received. iPhone said: " + (err.ifEmpty { "nothing" }) + "\n" + mux.dbg
                   val sb = StringBuilder()
                   val pt = rows["ProductType"]
                   sb.append("MODEL: ").append(MODELS[pt] ?: "Unknown").append("  (").append(pt ?: "N/A").append(")\n")

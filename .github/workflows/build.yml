@@ -39,14 +39,19 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 3
-              versionName = "0.3"
+              versionCode = 4
+              versionName = "0.4"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
               targetCompatibility = JavaVersion.VERSION_17
             }
             kotlinOptions { jvmTarget = "17" }
+            packaging { resources.excludes.add("META-INF/versions/9/OSGI-INF/MANIFEST.MF") }
+          }
+          dependencies {
+            implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+            implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
           }
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
@@ -71,9 +76,39 @@ jobs:
           import android.hardware.usb.*
           import android.os.Build
           import android.os.Bundle
+          import android.util.Base64
           import android.widget.*
           import java.io.ByteArrayOutputStream
+          import java.math.BigInteger
+          import java.net.Socket
           import java.nio.ByteBuffer
+          import java.security.KeyFactory
+          import java.security.KeyPairGenerator
+          import java.security.Principal
+          import java.security.PrivateKey
+          import java.security.PublicKey
+          import java.security.cert.CertificateFactory
+          import java.security.cert.X509Certificate
+          import java.security.spec.PKCS8EncodedKeySpec
+          import java.security.spec.RSAPublicKeySpec
+          import java.security.spec.X509EncodedKeySpec
+          import java.util.Date
+          import java.util.UUID
+          import javax.net.ssl.KeyManager
+          import javax.net.ssl.SSLContext
+          import javax.net.ssl.SSLEngine
+          import javax.net.ssl.SSLEngineResult
+          import javax.net.ssl.TrustManager
+          import javax.net.ssl.X509KeyManager
+          import javax.net.ssl.X509TrustManager
+          import org.bouncycastle.asn1.x500.X500Name
+          import org.bouncycastle.asn1.x509.BasicConstraints
+          import org.bouncycastle.asn1.x509.Extension
+          import org.bouncycastle.asn1.x509.KeyUsage
+          import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+          import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils
+          import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+          import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
           import org.w3c.dom.Element
 
           class Mux(private val c: UsbDeviceConnection, private val ein: UsbEndpoint, private val eout: UsbEndpoint) {
@@ -193,10 +228,167 @@ jobs:
               }
 
               fun ask(body: String): String? {
-                  val x = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>STAR</string>" + body + "</dict></plist>").toByteArray()
-                  val b = ByteBuffer.allocate(4 + x.size)
-                  b.putInt(x.size); b.put(x)
-                  if (!send(b.array())) return null
+                  if (!send(frame(body))) return null
+                  return readMsg()?.toString(Charsets.UTF_8)
+              }
+
+              fun sendRaw(d: ByteArray): Boolean = send(d)
+
+              fun recvRaw(): ByteArray? {
+                  repeat(6) {
+                      val t = recv() ?: return null
+                      if ((t.flags and 4) != 0) return null
+                      if (t.data.isNotEmpty()) { ack += t.data.size; raw(tcp(0x10)); return t.data }
+                  }
+                  return null
+              }
+          }
+
+          fun frame(body: String): ByteArray {
+              val x = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>STAR</string>" + body + "</dict></plist>").toByteArray()
+              val b = ByteBuffer.allocate(4 + x.size)
+              b.putInt(x.size); b.put(x)
+              return b.array()
+          }
+
+          fun valOf(x: String?): Element? = if (x == null) null else parse(x).firstOrNull { it.first == "Value" }?.second
+
+          class Pairing(
+              val hostId: String, val buid: String, val hostCert: String, val hostKey: PrivateKey,
+              val rootCert: String, val deviceCert: String, val hostCertObj: X509Certificate, val rootCertObj: X509Certificate
+          )
+
+          fun pem(label: String, der: ByteArray): String {
+              val b = Base64.encodeToString(der, Base64.NO_WRAP)
+              return "-----BEGIN " + label + "-----\n" + b.chunked(64).joinToString("\n") + "\n-----END " + label + "-----\n"
+          }
+
+          fun b64(s: String): String = Base64.encodeToString(s.toByteArray(), Base64.NO_WRAP)
+
+          fun parsePub(p: String): PublicKey {
+              val der = Base64.decode(p.lines().filter { !it.startsWith("-----") }.joinToString(""), Base64.DEFAULT)
+              val kf = KeyFactory.getInstance("RSA")
+              return if (p.contains("RSA PUBLIC KEY")) {
+                  val rp = org.bouncycastle.asn1.pkcs.RSAPublicKey.getInstance(der)
+                  kf.generatePublic(RSAPublicKeySpec(rp.modulus, rp.publicExponent))
+              } else kf.generatePublic(X509EncodedKeySpec(der))
+          }
+
+          fun makeCert(subject: String, issuer: String, pub: PublicKey, signKey: PrivateKey, ca: Boolean): X509Certificate {
+              val now = System.currentTimeMillis()
+              val b = JcaX509v3CertificateBuilder(
+                  X500Name("CN=" + issuer), BigInteger.ONE, Date(now - 86400000L), Date(now + 3650L * 86400000L),
+                  X500Name("CN=" + subject), pub
+              )
+              b.addExtension(Extension.basicConstraints, true, BasicConstraints(ca))
+              b.addExtension(Extension.subjectKeyIdentifier, false, JcaX509ExtensionUtils().createSubjectKeyIdentifier(pub))
+              if (!ca) b.addExtension(Extension.keyUsage, true, KeyUsage(KeyUsage.digitalSignature or KeyUsage.keyEncipherment))
+              return JcaX509CertificateConverter().getCertificate(b.build(JcaContentSignerBuilder("SHA256withRSA").build(signKey)))
+          }
+
+          fun newPairing(devPubPem: String): Pairing {
+              val g = KeyPairGenerator.getInstance("RSA")
+              g.initialize(2048)
+              val root = g.generateKeyPair()
+              val host = g.generateKeyPair()
+              val rc = makeCert("root", "root", root.public, root.private, true)
+              val hc = makeCert("host", "root", host.public, root.private, false)
+              val dc = makeCert("device", "root", parsePub(devPubPem), root.private, false)
+              return Pairing(
+                  UUID.randomUUID().toString().uppercase(), UUID.randomUUID().toString().uppercase(),
+                  pem("CERTIFICATE", hc.encoded), host.private, pem("CERTIFICATE", rc.encoded),
+                  pem("CERTIFICATE", dc.encoded), hc, rc
+              )
+          }
+
+          fun sslEngine(p: Pairing): SSLEngine {
+              val km = object : X509KeyManager {
+                  override fun getClientAliases(t: String?, i: Array<Principal>?): Array<String>? = arrayOf("h")
+                  override fun chooseClientAlias(t: Array<String>?, i: Array<Principal>?, s: Socket?): String? = "h"
+                  override fun getServerAliases(t: String?, i: Array<Principal>?): Array<String>? = null
+                  override fun chooseServerAlias(t: String?, i: Array<Principal>?, s: Socket?): String? = null
+                  override fun getCertificateChain(a: String?): Array<X509Certificate> = arrayOf(p.hostCertObj, p.rootCertObj)
+                  override fun getPrivateKey(a: String?): PrivateKey = p.hostKey
+              }
+              val tm = object : X509TrustManager {
+                  override fun checkClientTrusted(c: Array<X509Certificate>?, a: String?) {}
+                  override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {}
+                  override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+              }
+              val ctx = SSLContext.getInstance("TLS")
+              ctx.init(arrayOf<KeyManager>(km), arrayOf<TrustManager>(tm), null)
+              val e = ctx.createSSLEngine()
+              e.useClientMode = true
+              e.enabledProtocols = arrayOf("TLSv1.2")
+              e.enabledCipherSuites = e.supportedCipherSuites
+              return e
+          }
+
+          class Tls(private val m: Mux, private val e: SSLEngine) {
+              private val inNet = ByteBuffer.allocate(1 shl 17).apply { flip() }
+              private val app = ByteArrayOutputStream()
+
+              private fun fill(): Boolean {
+                  val d = m.recvRaw() ?: return false
+                  inNet.compact(); inNet.put(d); inNet.flip()
+                  return true
+              }
+
+              private fun wrapSend(src: ByteBuffer) {
+                  val out = ByteBuffer.allocate(e.session.packetBufferSize + 1024)
+                  e.wrap(src, out)
+                  out.flip()
+                  if (out.hasRemaining()) {
+                      val b = ByteArray(out.remaining())
+                      out.get(b)
+                      m.sendRaw(b)
+                  }
+              }
+
+              private fun pump(): Boolean {
+                  if (!inNet.hasRemaining() && !fill()) return false
+                  val dst = ByteBuffer.allocate(e.session.applicationBufferSize)
+                  val r = e.unwrap(inNet, dst)
+                  if (dst.position() > 0) app.write(dst.array(), 0, dst.position())
+                  if (r.status == SSLEngineResult.Status.BUFFER_UNDERFLOW && !fill()) return false
+                  return true
+              }
+
+              fun handshake(): Boolean {
+                  e.beginHandshake()
+                  var n = 0
+                  while (n++ < 300) {
+                      when (e.handshakeStatus) {
+                          SSLEngineResult.HandshakeStatus.NEED_WRAP -> wrapSend(ByteBuffer.allocate(0))
+                          SSLEngineResult.HandshakeStatus.NEED_UNWRAP -> if (!pump()) return false
+                          SSLEngineResult.HandshakeStatus.NEED_TASK -> {
+                              var t = e.delegatedTask
+                              while (t != null) { t.run(); t = e.delegatedTask }
+                          }
+                          else -> return true
+                      }
+                  }
+                  return false
+              }
+
+              private fun readMsg(): ByteArray? {
+                  repeat(40) {
+                      val a = app.toByteArray()
+                      if (a.size >= 4) {
+                          val len = ByteBuffer.wrap(a).getInt()
+                          if (len >= 0 && a.size >= 4 + len) {
+                              app.reset(); app.write(a, 4 + len, a.size - 4 - len)
+                              return a.copyOfRange(4, 4 + len)
+                          }
+                      }
+                      if (!pump()) return null
+                  }
+                  return null
+              }
+
+              fun ask(body: String): String? {
+                  val src = ByteBuffer.wrap(frame(body))
+                  while (src.hasRemaining()) wrapSend(src)
                   return readMsg()?.toString(Charsets.UTF_8)
               }
           }
@@ -313,42 +505,148 @@ jobs:
                   return null
               }
 
+              private var pairErr = ""
+
+              private fun say(s: String) { runOnUiThread { out.text = s } }
+
+              private fun loadPair(udid: String): Pairing? {
+                  val s = getSharedPreferences("pairs", MODE_PRIVATE).getString(udid, null) ?: return null
+                  val f = s.split("|")
+                  if (f.size < 6) return null
+                  return try {
+                      val cf = CertificateFactory.getInstance("X.509")
+                      val hc = cf.generateCertificate(f[2].byteInputStream()) as X509Certificate
+                      val rc = cf.generateCertificate(f[4].byteInputStream()) as X509Certificate
+                      val key = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(Base64.decode(f[3], Base64.DEFAULT)))
+                      Pairing(f[0], f[1], f[2], key, f[4], f[5], hc, rc)
+                  } catch (e: Exception) { null }
+              }
+
+              private fun savePair(udid: String, p: Pairing) {
+                  val s = listOf(p.hostId, p.buid, p.hostCert, Base64.encodeToString(p.hostKey.encoded, Base64.NO_WRAP), p.rootCert, p.deviceCert).joinToString("|")
+                  getSharedPreferences("pairs", MODE_PRIVATE).edit().putString(udid, s).apply()
+              }
+
+              private fun forgetPair(udid: String) {
+                  getSharedPreferences("pairs", MODE_PRIVATE).edit().remove(udid).apply()
+              }
+
+              private fun pair(mux: Mux): Pairing? {
+                  val dv = valOf(mux.ask("<key>Request</key><string>GetValue</string><key>Key</key><string>DevicePublicKey</string>"))
+                  if (dv == null) { pairErr = "no device key"; return null }
+                  val p = newPairing(String(Base64.decode(dv.textContent.trim(), Base64.DEFAULT)))
+                  val body = "<key>Request</key><string>Pair</string><key>PairRecord</key><dict>" +
+                      "<key>DeviceCertificate</key><data>" + b64(p.deviceCert) + "</data>" +
+                      "<key>HostCertificate</key><data>" + b64(p.hostCert) + "</data>" +
+                      "<key>HostID</key><string>" + p.hostId + "</string>" +
+                      "<key>RootCertificate</key><data>" + b64(p.rootCert) + "</data>" +
+                      "<key>SystemBUID</key><string>" + p.buid + "</string></dict>" +
+                      "<key>ProtocolVersion</key><string>2</string>" +
+                      "<key>PairingOptions</key><dict><key>ExtendedPairingErrors</key><true/></dict>"
+                  repeat(30) {
+                      val r = mux.ask(body)
+                      if (r == null) { pairErr = "no reply from iPhone"; return null }
+                      val e = parse(r).firstOrNull { it.first == "Error" }?.second?.textContent
+                      if (e == null) return p
+                      if (e != "PairingDialogResponsePending") { pairErr = e; return null }
+                      Thread.sleep(2000)
+                  }
+                  pairErr = "Trust was not tapped in time"
+                  return null
+              }
+
+              private fun session(mux: Mux, p: Pairing): Tls? {
+                  val r = mux.ask("<key>Request</key><string>StartSession</string><key>HostID</key><string>" + p.hostId + "</string><key>SystemBUID</key><string>" + p.buid + "</string>") ?: return null
+                  val t = parse(r)
+                  if (t.any { it.first == "Error" }) return null
+                  if (t.firstOrNull { it.first == "EnableSessionSSL" }?.second?.tagName != "true") return null
+                  val tls = Tls(mux, sslEngine(p))
+                  return if (tls.handshake()) tls else null
+              }
+
+              private fun gbs(s: String?): String? {
+                  val v = s?.toDoubleOrNull() ?: return null
+                  return String.format("%.0f GB", v / 1e9)
+              }
+
+              private fun fmt(rows: Map<String, String>): String {
+                  val sb = StringBuilder()
+                  val used = HashSet<String>()
+                  fun line(label: String, v: String?, vararg keys: String) {
+                      if (v != null) sb.append(label).append(": ").append(v).append("\n")
+                      used.addAll(keys)
+                  }
+                  val pt = rows["ProductType"]
+                  sb.append("MODEL: ").append(MODELS[pt] ?: "Unknown").append("  (").append(pt ?: "N/A").append(")\n")
+                  line("iOS", (rows["ProductVersion"] ?: "?") + " (" + (rows["BuildVersion"] ?: "?") + ")", "ProductVersion", "BuildVersion", "ProductType")
+                  line("Serial", rows["SerialNumber"], "SerialNumber")
+                  line("IMEI", rows["InternationalMobileEquipmentIdentity"], "InternationalMobileEquipmentIdentity")
+                  line("IMEI 2", rows["InternationalMobileEquipmentIdentity2"], "InternationalMobileEquipmentIdentity2")
+                  line("Model no", rows["ModelNumber"], "ModelNumber")
+                  line("Region", rows["RegionInfo"], "RegionInfo")
+                  line("Activation", rows["ActivationState"], "ActivationState")
+                  line("Find My iPhone", rows["fmip"]?.let { if (it == "Yes") "ON (iCloud locked)" else "OFF" }, "fmip")
+                  line("Storage", gbs(rows["disk.TotalDiskCapacity"]), "disk.TotalDiskCapacity")
+                  line("Free space", gbs(rows["disk.AmountDataAvailable"]), "disk.AmountDataAvailable")
+                  line("Battery level", rows["bat.BatteryCurrentCapacity"]?.let { it + "%" }, "bat.BatteryCurrentCapacity")
+                  line("Color code", rows["DeviceColor"], "DeviceColor")
+                  line("Enclosure color", rows["DeviceEnclosureColor"], "DeviceEnclosureColor")
+                  line("Wi-Fi MAC", rows["WiFiAddress"], "WiFiAddress")
+                  line("Bluetooth MAC", rows["BluetoothAddress"], "BluetoothAddress")
+                  line("Name", rows["DeviceName"], "DeviceName")
+                  line("UDID", rows["UniqueDeviceID"], "UniqueDeviceID")
+                  sb.append("\n--- Other values ---\n")
+                  for ((k, v) in rows) if (k !in used && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
+                  return sb.toString()
+              }
+
               private fun query(d: UsbDevice): String {
                   val mux = openMux(d) ?: return "Could not open the USB channel. Unplug, replug, unlock iPhone and scan again."
                   if (!mux.start()) return "usbmux handshake failed.\n" + info + "\n" + mux.dbg
                   if (!mux.open(62078)) return "iPhone info service did not answer.\n" + info + "\n" + mux.dbg
                   val rows = LinkedHashMap<String, String>()
-                  var err = ""
-                  val all = mux.ask("<key>Request</key><string>GetValue</string>")
-                  if (all != null) {
+                  fun addAll(r: String?, prefix: String) {
                       try {
-                          val top = parse(all)
-                          val v = top.firstOrNull { it.first == "Value" }?.second
-                          if (v != null && v.tagName == "dict") for ((k, e) in kv(v)) rows[k] = show(e)
-                          top.firstOrNull { it.first == "Error" }?.let { err = show(it.second) }
-                      } catch (e: Exception) { err = "parse error" }
+                          val v = valOf(r)
+                          if (v != null && v.tagName == "dict") for ((k, e) in kv(v)) rows[prefix + k] = show(e)
+                      } catch (e: Exception) { }
                   }
-                  if (rows.size < 3) {
-                      for (k in listOf("ProductType", "ProductVersion", "BuildVersion", "DeviceName", "UniqueDeviceID", "SerialNumber", "ActivationState", "ModelNumber", "RegionInfo", "HardwareModel")) {
-                          val r = mux.ask("<key>Request</key><string>GetValue</string><key>Key</key><string>" + k + "</string>") ?: break
-                          try {
-                              val t = parse(r)
-                              val v = t.firstOrNull { it.first == "Value" }?.second
-                              if (v != null) rows[k] = show(v)
-                              t.firstOrNull { it.first == "Error" }?.let { err = show(it.second) }
-                          } catch (e: Exception) { }
+                  addAll(mux.ask("<key>Request</key><string>GetValue</string>"), "")
+                  if (rows.isEmpty()) return "No data received.\n" + mux.dbg
+                  val udid = rows["UniqueDeviceID"]
+                  var pairing: Pairing? = if (udid != null) loadPair(udid) else null
+                  var tls: Tls? = null
+                  try {
+                      if (pairing != null) {
+                          tls = session(mux, pairing)
+                          if (tls == null) {
+                              forgetPair(udid!!)
+                              return fmt(rows) + "\n\nSaved trust was rejected. Press Scan again and tap Trust."
+                          }
+                      } else {
+                          say(fmt(rows) + "\n\nTap TRUST on the iPhone (enter its passcode if asked)...")
+                          pairing = pair(mux)
+                          if (pairing == null) return fmt(rows) + "\n\nPairing failed: " + pairErr
+                          if (udid != null) savePair(udid, pairing)
+                          tls = session(mux, pairing)
                       }
+                  } catch (e: Exception) {
+                      return fmt(rows) + "\n\nSecure step error: " + e.toString()
                   }
-                  if (rows.isEmpty()) return "No data received. iPhone said: " + (err.ifEmpty { "nothing" }) + "\n" + mux.dbg
-                  val sb = StringBuilder()
-                  val pt = rows["ProductType"]
-                  sb.append("MODEL: ").append(MODELS[pt] ?: "Unknown").append("  (").append(pt ?: "N/A").append(")\n")
-                  for ((k, label) in WANTED) rows[k]?.let { sb.append(label).append(": ").append(it).append("\n") }
-                  sb.append("\n--- Other values ---\n")
-                  val used = WANTED.map { it.first } + "ProductType"
-                  for ((k, v) in rows) if (k !in used && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
-                  if (err.isNotEmpty()) sb.append("\nNote: ").append(err).append("\n")
-                  return sb.toString()
+                  if (tls == null) return fmt(rows) + "\n\nPaired, but the secure session failed. Press Scan again."
+                  val t: Tls = tls
+                  fun dom(domain: String, key: String?): String? =
+                      t.ask("<key>Request</key><string>GetValue</string><key>Domain</key><string>" + domain + "</string>" +
+                          (if (key != null) "<key>Key</key><string>" + key + "</string>" else ""))
+                  try {
+                      addAll(t.ask("<key>Request</key><string>GetValue</string>"), "")
+                      addAll(dom("com.apple.disk_usage", null), "disk.")
+                      addAll(dom("com.apple.mobile.battery", null), "bat.")
+                      valOf(dom("com.apple.fmip", "IsAssociated"))?.let { rows["fmip"] = show(it) }
+                  } catch (e: Exception) {
+                      return fmt(rows) + "\n\nRead error: " + e.toString()
+                  }
+                  return fmt(rows)
               }
 
               private fun scan() {

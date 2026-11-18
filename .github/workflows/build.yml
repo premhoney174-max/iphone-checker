@@ -39,8 +39,8 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 4
-              versionName = "0.4"
+              versionCode = 5
+              versionName = "0.5"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -161,18 +161,51 @@ jobs:
                   return pkt(6, b.array())
               }
 
+              private val rbuf = ByteArrayOutputStream()
+              private val q = java.util.ArrayDeque<In>()
+
               private fun recv(): In? {
                   repeat(8) {
+                      q.pollFirst()?.let { return it }
                       val r = rd() ?: return null
-                      if (r.size < 16) return@repeat
-                      val bb = ByteBuffer.wrap(r)
-                      val proto = bb.getInt(0)
-                      val len = minOf(bb.getInt(4), r.size)
-                      rx = bb.getShort(12).toInt() and 0xFFFF
-                      if (proto == 6 && len >= 36) {
-                          val off = ((r[28].toInt() and 0xF0) shr 4) * 4
-                          if (16 + off <= len) return In(r[29].toInt() and 0xFF, bb.getInt(20), r.copyOfRange(16 + off, len))
+                      rbuf.write(r)
+                      val a = rbuf.toByteArray()
+                      val bb = ByteBuffer.wrap(a)
+                      var off = 0
+                      while (a.size - off >= 16) {
+                          val len = bb.getInt(off + 4)
+                          if (len < 16 || len > 70000) { off = a.size; break }
+                          if (a.size - off < len) break
+                          val proto = bb.getInt(off)
+                          rx = bb.getShort(off + 12).toInt() and 0xFFFF
+                          if (proto == 6 && len >= 36) {
+                              val hl = ((a[off + 28].toInt() and 0xF0) shr 4) * 4
+                              if (16 + hl <= len) {
+                                  q.add(In(a[off + 29].toInt() and 0xFF, bb.getInt(off + 20), a.copyOfRange(off + 16 + hl, off + len)))
+                              }
+                          }
+                          off += len
                       }
+                      rbuf.reset()
+                      if (off < a.size) rbuf.write(a, off, a.size - off)
+                  }
+                  return q.pollFirst()
+              }
+
+              private fun nextData(): ByteArray? {
+                  repeat(12) {
+                      val t = recv() ?: return null
+                      if ((t.flags and 4) != 0) return null
+                      if (t.data.isEmpty()) return@repeat
+                      val end = t.seq + t.data.size
+                      if (end - ack <= 0) {
+                          dbg.append("dup ").append(t.seq).append("\n")
+                          raw(tcp(0x10))
+                          return@repeat
+                      }
+                      ack = end
+                      raw(tcp(0x10))
+                      return t.data
                   }
                   return null
               }
@@ -220,9 +253,8 @@ jobs:
                               return a.copyOfRange(4, 4 + len)
                           }
                       }
-                      val t = recv() ?: return null
-                      if ((t.flags and 4) != 0) return null
-                      if (t.data.isNotEmpty()) { acc.write(t.data); ack += t.data.size; raw(tcp(0x10)) }
+                      val d = nextData() ?: return null
+                      acc.write(d)
                   }
                   return null
               }
@@ -234,14 +266,7 @@ jobs:
 
               fun sendRaw(d: ByteArray): Boolean = send(d)
 
-              fun recvRaw(): ByteArray? {
-                  repeat(6) {
-                      val t = recv() ?: return null
-                      if ((t.flags and 4) != 0) return null
-                      if (t.data.isNotEmpty()) { ack += t.data.size; raw(tcp(0x10)); return t.data }
-                  }
-                  return null
-              }
+              fun recvRaw(): ByteArray? = nextData()
           }
 
           fun frame(body: String): ByteArray {
@@ -631,7 +656,7 @@ jobs:
                           tls = session(mux, pairing)
                       }
                   } catch (e: Exception) {
-                      return fmt(rows) + "\n\nSecure step error: " + e.toString()
+                      return fmt(rows) + "\n\nSecure step error: " + e.toString().take(160) + "\n" + mux.dbg.takeLast(700)
                   }
                   if (tls == null) return fmt(rows) + "\n\nPaired, but the secure session failed. Press Scan again."
                   val t: Tls = tls
@@ -644,7 +669,7 @@ jobs:
                       addAll(dom("com.apple.mobile.battery", null), "bat.")
                       valOf(dom("com.apple.fmip", "IsAssociated"))?.let { rows["fmip"] = show(it) }
                   } catch (e: Exception) {
-                      return fmt(rows) + "\n\nRead error: " + e.toString()
+                      return fmt(rows) + "\n\nRead error: " + e.toString().take(160) + "\n" + mux.dbg.takeLast(700)
                   }
                   return fmt(rows)
               }

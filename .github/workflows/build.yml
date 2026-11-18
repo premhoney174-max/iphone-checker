@@ -39,8 +39,8 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 5
-              versionName = "0.5"
+              versionCode = 7
+              versionName = "0.7"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -117,12 +117,14 @@ jobs:
               private var seq = 0
               private var ack = 0
               private var dport = 0
+              private var sport = 49152
+              private var conns = 0
               private val acc = ByteArrayOutputStream()
               val dbg = StringBuilder()
 
               private fun hex(b: ByteArray) = b.take(40).joinToString("") { "%02x".format(it) }
 
-              class In(val flags: Int, val seq: Int, val data: ByteArray)
+              class In(val flags: Int, val seq: Int, val data: ByteArray, val dst: Int)
 
               private fun raw(b: ByteArray): Boolean {
                   val n = c.bulkTransfer(eout, b, b.size, 3000)
@@ -153,7 +155,7 @@ jobs:
 
               private fun tcp(flags: Int, data: ByteArray = ByteArray(0)): ByteArray {
                   val b = ByteBuffer.allocate(20 + data.size)
-                  b.putShort(49152.toShort()); b.putShort(dport.toShort())
+                  b.putShort(sport.toShort()); b.putShort(dport.toShort())
                   b.putInt(seq); b.putInt(ack)
                   b.put(0x50.toByte()); b.put(flags.toByte())
                   b.putShort(512.toShort()); b.putShort(0); b.putShort(0)
@@ -181,7 +183,7 @@ jobs:
                           if (proto == 6 && len >= 36) {
                               val hl = ((a[off + 28].toInt() and 0xF0) shr 4) * 4
                               if (16 + hl <= len) {
-                                  q.add(In(a[off + 29].toInt() and 0xFF, bb.getInt(off + 20), a.copyOfRange(off + 16 + hl, off + len)))
+                                  q.add(In(a[off + 29].toInt() and 0xFF, bb.getInt(off + 20), a.copyOfRange(off + 16 + hl, off + len), bb.getShort(off + 18).toInt() and 0xFFFF))
                               }
                           }
                           off += len
@@ -196,7 +198,7 @@ jobs:
                   repeat(12) {
                       val t = recv() ?: return null
                       if ((t.flags and 4) != 0) return null
-                      if (t.data.isEmpty()) return@repeat
+                      if (t.data.isEmpty() || t.dst != sport) return@repeat
                       val end = t.seq + t.data.size
                       if (end - ack <= 0) {
                           dbg.append("dup ").append(t.seq).append("\n")
@@ -226,11 +228,12 @@ jobs:
               }
 
               fun open(port: Int): Boolean {
-                  dport = port; seq = 0; ack = 0
+                  dport = port; seq = 0; ack = 0; sport = 49152 + conns; conns++; acc.reset()
                   if (!raw(tcp(2))) return false
                   seq = 1
                   repeat(6) {
                       val t = recv() ?: return false
+                      if (t.dst != sport) return@repeat
                       if ((t.flags and 0x12) == 0x12) { ack = t.seq + 1; return raw(tcp(0x10)) }
                       if ((t.flags and 4) != 0) return false
                   }
@@ -259,21 +262,34 @@ jobs:
                   return null
               }
 
-              fun ask(body: String): String? {
-                  if (!send(frame(body))) return null
+              fun ask(body: String, lbl: Boolean = true): String? {
+                  if (!send(frame(body, lbl))) return null
                   return readMsg()?.toString(Charsets.UTF_8)
               }
 
               fun sendRaw(d: ByteArray): Boolean = send(d)
 
               fun recvRaw(): ByteArray? = nextData()
+
+              fun closeConn() { try { raw(tcp(4)) } catch (e: Exception) { } }
+
+              fun close() {
+                  try { raw(tcp(4)) } catch (e: Exception) { }
+                  try { c.close() } catch (e: Exception) { }
+              }
           }
 
-          fun frame(body: String): ByteArray {
-              val x = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>STAR</string>" + body + "</dict></plist>").toByteArray()
+          fun frame(body: String, lbl: Boolean = true): ByteArray {
+              val x = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>" + (if (lbl) "<key>Label</key><string>STAR</string>" else "") + body + "</dict></plist>").toByteArray()
               val b = ByteBuffer.allocate(4 + x.size)
               b.putInt(x.size); b.put(x)
               return b.array()
+          }
+
+          fun dive(e: Element?, vararg path: String): Element? {
+              var cur = e
+              for (p in path) cur = if (cur == null) null else kv(cur).firstOrNull { it.first == p }?.second
+              return cur
           }
 
           fun valOf(x: String?): Element? = if (x == null) null else parse(x).firstOrNull { it.first == "Value" }?.second
@@ -411,8 +427,8 @@ jobs:
                   return null
               }
 
-              fun ask(body: String): String? {
-                  val src = ByteBuffer.wrap(frame(body))
+              fun ask(body: String, lbl: Boolean = true): String? {
+                  val src = ByteBuffer.wrap(frame(body, lbl))
                   while (src.hasRemaining()) wrapSend(src)
                   return readMsg()?.toString(Charsets.UTF_8)
               }
@@ -472,9 +488,14 @@ jobs:
               private lateinit var usb: UsbManager
               @Volatile private var busy = false
               private var info = ""
+              private var last = ""
 
               private val rx = object : BroadcastReceiver() {
-                  override fun onReceive(c: Context, i: Intent) { scan() }
+                  override fun onReceive(c: Context, i: Intent) {
+                      if (i.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
+                          if (!busy) out.text = "WARNING: iPhone disconnected. Reconnect the cable and press Scan.\n\n" + last
+                      } else scan()
+                  }
               }
 
               override fun onCreate(b: Bundle?) {
@@ -620,13 +641,27 @@ jobs:
                   line("Bluetooth MAC", rows["BluetoothAddress"], "BluetoothAddress")
                   line("Name", rows["DeviceName"], "DeviceName")
                   line("UDID", rows["UniqueDeviceID"], "UniqueDeviceID")
+                  val bd = rows["batt.DesignCapacity"]?.toDoubleOrNull()
+                  val bn = (rows["batt.NominalChargeCapacity"] ?: rows["batt.AppleRawMaxCapacity"])?.toDoubleOrNull()
+                  val hp = rows["batt.MaximumCapacityPercent"]?.toDoubleOrNull() ?: (if (bd != null && bn != null && bd > 0) bn / bd * 100 else null)
+                  line("Battery health", hp?.let { String.format("%.0f%%", it) })
+                  line("Charge cycles", rows["batt.CycleCount"])
+                  line("Design capacity", bd?.let { String.format("%.0f mAh", it) })
+                  line("Current max capacity", bn?.let { String.format("%.0f mAh", it) })
+                  line("Battery temp", rows["batt.Temperature"]?.toDoubleOrNull()?.let { String.format("%.1f C", it / 100) })
+                  line("Battery serial", rows["batt.Serial"] ?: rows["batt.BatterySerialNumber"])
+                  line("Battery note", rows["batt.note"])
                   sb.append("\n--- Other values ---\n")
-                  for ((k, v) in rows) if (k !in used && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
+                  for ((k, v) in rows) if (k !in used && !k.startsWith("batt.") && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
                   return sb.toString()
               }
 
               private fun query(d: UsbDevice): String {
                   val mux = openMux(d) ?: return "Could not open the USB channel. Unplug, replug, unlock iPhone and scan again."
+                  try { return query2(mux) } finally { mux.close() }
+              }
+
+              private fun query2(mux: Mux): String {
                   if (!mux.start()) return "usbmux handshake failed.\n" + info + "\n" + mux.dbg
                   if (!mux.open(62078)) return "iPhone info service did not answer.\n" + info + "\n" + mux.dbg
                   val rows = LinkedHashMap<String, String>()
@@ -671,6 +706,39 @@ jobs:
                   } catch (e: Exception) {
                       return fmt(rows) + "\n\nRead error: " + e.toString().take(160) + "\n" + mux.dbg.takeLast(700)
                   }
+                  val pr = pairing ?: return fmt(rows)
+                  var note = ""
+                  try {
+                      val raw = t.ask("<key>Request</key><string>StartService</string><key>Service</key><string>com.apple.mobile.diagnostics_relay</string>")
+                      val sr = if (raw != null) parse(raw) else emptyList()
+                      val port = sr.firstOrNull { it.first == "Port" }?.second?.textContent?.trim()?.toIntOrNull()
+                      val ssl = sr.firstOrNull { it.first == "EnableServiceSSL" }?.second?.tagName == "true"
+                      if (port == null) {
+                          note = "Battery service refused: " + (sr.firstOrNull { it.first == "Error" }?.second?.textContent ?: "no reply")
+                      } else {
+                          mux.closeConn()
+                          if (!mux.open(port)) {
+                              note = "Battery service did not connect"
+                          } else {
+                              val body = "<key>Request</key><string>IORegistry</string><key>EntryClass</key><string>IOPMPowerSource</string>"
+                              var resp: String? = null
+                              if (ssl) {
+                                  val st = Tls(mux, sslEngine(pr))
+                                  if (st.handshake()) resp = st.ask(body, false) else note = "Battery secure session failed"
+                              } else resp = mux.ask(body, false)
+                              if (resp != null) {
+                                  val reg = dive(parse(resp).firstOrNull { it.first == "Diagnostics" }?.second, "IORegistry")
+                                  if (reg == null) {
+                                      note = "No battery data returned"
+                                  } else {
+                                      for ((k2, e2) in kv(reg)) rows["batt." + k2] = show(e2)
+                                      dive(reg, "BatteryData")?.let { bd -> for ((k3, e3) in kv(bd)) rows.putIfAbsent("batt." + k3, show(e3)) }
+                                  }
+                              } else if (note.isEmpty()) note = "No battery reply"
+                          }
+                      }
+                  } catch (e: Exception) { note = "Battery error: " + e.toString().take(120) }
+                  if (note.isNotEmpty()) rows["batt.note"] = note
                   return fmt(rows)
               }
 
@@ -692,7 +760,7 @@ jobs:
                   out.text = "Reading iPhone... keep it unlocked."
                   Thread {
                       val r = try { query(d) } catch (e: Exception) { "Error: " + e.toString() }
-                      runOnUiThread { out.text = r; busy = false }
+                      runOnUiThread { out.text = r; last = r; busy = false }
                   }.start()
               }
           }

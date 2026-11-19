@@ -39,8 +39,8 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 7
-              versionName = "0.7"
+              versionCode = 8
+              versionName = "0.8"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -475,6 +475,20 @@ jobs:
               "iPhone17,2" to "iPhone 16 Pro Max", "iPhone17,5" to "iPhone 16e"
           )
 
+          val DESIGN = mapOf(
+              "iPhone12,1" to 3110, "iPhone12,3" to 3046, "iPhone12,5" to 3969, "iPhone12,8" to 1821,
+              "iPhone13,1" to 2227, "iPhone13,2" to 2815, "iPhone13,3" to 2815, "iPhone13,4" to 3687,
+              "iPhone14,4" to 2406, "iPhone14,5" to 3227, "iPhone14,2" to 3095, "iPhone14,3" to 4352, "iPhone14,6" to 2018,
+              "iPhone14,7" to 3279, "iPhone14,8" to 4325, "iPhone15,2" to 3200, "iPhone15,3" to 4323,
+              "iPhone15,4" to 3349, "iPhone15,5" to 4383, "iPhone16,1" to 3274, "iPhone16,2" to 4441,
+              "iPhone17,3" to 3561, "iPhone17,4" to 4674, "iPhone17,1" to 3582, "iPhone17,2" to 4685
+          )
+
+          val PROBES = listOf(
+              "AppleH10CamIn", "AppleH11CamIn", "AppleH13CamIn", "AppleH14CamIn", "AppleH15CamIn", "AppleH16CamIn",
+              "AppleCLCD2", "IOMobileFramebuffer", "AppleMultitouchSPI", "AppleBiometricSensor", "AppleARMPMUCharger"
+          )
+
           val WANTED = listOf(
               "ProductVersion" to "iOS version", "BuildVersion" to "Build", "DeviceName" to "Name",
               "HardwareModel" to "Board", "ModelNumber" to "Model number", "RegionInfo" to "Region",
@@ -610,6 +624,49 @@ jobs:
                   return if (tls.handshake()) tls else null
               }
 
+              private fun battHealth(rows: Map<String, String>): Double? {
+                  val bd = rows["batt.DesignCapacity"]?.toDoubleOrNull()
+                  val bn = (rows["batt.NominalChargeCapacity"] ?: rows["batt.AppleRawMaxCapacity"])?.toDoubleOrNull()
+                  return rows["batt.MaximumCapacityPercent"]?.toDoubleOrNull() ?: (if (bd != null && bn != null && bd > 0) bn / bd * 100 else null)
+              }
+
+              private fun checks(rows: Map<String, String>): List<String> {
+                  val o = ArrayList<String>()
+                  val mn = rows["ModelNumber"] ?: ""
+                  when (mn.firstOrNull()) {
+                      'M' -> o.add("✅ Retail (new) unit")
+                      'F' -> o.add("⚠️ Refurbished unit (model starts with F)")
+                      'N' -> o.add("⚠️ Apple replacement unit (model starts with N)")
+                      'P' -> o.add("⚠️ Personalized/engraved unit (model starts with P)")
+                      else -> if (mn.isNotEmpty()) o.add("ℹ️ Model number: " + mn)
+                  }
+                  val act = rows["ActivationState"]
+                  if (act != null) o.add(if (act == "Activated") "✅ Activated" else "❌ Not activated: " + act)
+                  val fm = rows["fmip"]
+                  if (fm != null) o.add(if (fm == "Yes") "❌ Find My is ON (iCloud lock risk)" else "✅ Find My is OFF")
+                  if (rows["PasswordProtected"] == "Yes") o.add("⚠️ Passcode is set (remove before sale)")
+                  val bs = rows["batt.Serial"] ?: rows["batt.BatterySerialNumber"]
+                  if (rows.keys.any { it.startsWith("batt.") && it != "batt.note" }) {
+                      if (bs.isNullOrBlank()) o.add("⚠️ Battery serial missing (non-genuine battery?)")
+                      else if (bs.length != 17) o.add("⚠️ Battery serial format unusual")
+                      else o.add("✅ Battery serial looks normal")
+                      val hp = battHealth(rows)
+                      val cyc = rows["batt.CycleCount"]?.toIntOrNull()
+                      if (hp != null && cyc != null) {
+                          if (cyc > 500 && hp >= 95) o.add("⚠️ High cycles but health too good (possible fake or boosted)")
+                          else if (cyc < 20 && hp < 90) o.add("⚠️ Few cycles but low health (unusual)")
+                          else if (cyc <= 3) o.add("⚠️ Cycles near zero (new battery or reset?)")
+                          else o.add("✅ Health and cycles look consistent")
+                          if (hp < 80) o.add("⚠️ Battery health is below 80%")
+                      }
+                      val exp = DESIGN[rows["ProductType"]]
+                      val bd = rows["batt.DesignCapacity"]?.toDoubleOrNull()
+                      if (exp != null && bd != null && Math.abs(bd - exp) / exp > 0.10) o.add("⚠️ Design capacity differs from normal for this model")
+                  }
+                  if (o.isEmpty()) o.add("ℹ️ Not enough data for checks")
+                  return o
+              }
+
               private fun gbs(s: String?): String? {
                   val v = s?.toDoubleOrNull() ?: return null
                   return String.format("%.0f GB", v / 1e9)
@@ -651,8 +708,15 @@ jobs:
                   line("Battery temp", rows["batt.Temperature"]?.toDoubleOrNull()?.let { String.format("%.1f C", it / 100) })
                   line("Battery serial", rows["batt.Serial"] ?: rows["batt.BatterySerialNumber"])
                   line("Battery note", rows["batt.note"])
+                  sb.append("\n--- CHECKS ---\n")
+                  for (c in checks(rows)) sb.append(c).append("\n")
+                  val parts = rows.filterKeys { it.startsWith("part.") }
+                  if (parts.isNotEmpty()) {
+                      sb.append("\n--- PARTS (experimental) ---\n")
+                      for ((pk, pv) in parts) sb.append(pk.removePrefix("part.")).append(": ").append(pv).append("\n")
+                  }
                   sb.append("\n--- Other values ---\n")
-                  for ((k, v) in rows) if (k !in used && !k.startsWith("batt.") && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
+                  for ((k, v) in rows) if (k !in used && !k.startsWith("batt.") && !k.startsWith("part.") && !v.startsWith("(")) sb.append(k).append(": ").append(v).append("\n")
                   return sb.toString()
               }
 
@@ -721,11 +785,12 @@ jobs:
                               note = "Battery service did not connect"
                           } else {
                               val body = "<key>Request</key><string>IORegistry</string><key>EntryClass</key><string>IOPMPowerSource</string>"
-                              var resp: String? = null
+                              var dq: ((String) -> String?)? = null
                               if (ssl) {
                                   val st = Tls(mux, sslEngine(pr))
-                                  if (st.handshake()) resp = st.ask(body, false) else note = "Battery secure session failed"
-                              } else resp = mux.ask(body, false)
+                                  if (st.handshake()) dq = { b -> st.ask(b, false) } else note = "Battery secure session failed"
+                              } else dq = { b -> mux.ask(b, false) }
+                              val resp: String? = dq?.invoke(body)
                               if (resp != null) {
                                   val reg = dive(parse(resp).firstOrNull { it.first == "Diagnostics" }?.second, "IORegistry")
                                   if (reg == null) {
@@ -735,6 +800,24 @@ jobs:
                                       dive(reg, "BatteryData")?.let { bd -> for ((k3, e3) in kv(bd)) rows.putIfAbsent("batt." + k3, show(e3)) }
                                   }
                               } else if (note.isEmpty()) note = "No battery reply"
+                              if (dq != null && resp != null) {
+                                  val seen = ArrayList<String>()
+                                  for (cls in PROBES) {
+                                      val r2 = try { dq.invoke("<key>Request</key><string>IORegistry</string><key>EntryClass</key><string>" + cls + "</string>") } catch (e: Exception) { null }
+                                      if (r2 == null) break
+                                      try {
+                                          val reg2 = dive(parse(r2).firstOrNull { it.first == "Diagnostics" }?.second, "IORegistry")
+                                          if (reg2 != null && kv(reg2).isNotEmpty()) {
+                                              seen.add(cls)
+                                              for ((k4, e4) in kv(reg2)) {
+                                                  val v4 = show(e4)
+                                                  if (!v4.startsWith("(") && (k4.contains("serial", true) || k4.contains("module", true))) rows["part." + cls + "." + k4] = v4
+                                              }
+                                          }
+                                      } catch (e: Exception) { }
+                                  }
+                                  rows["part.classes responded"] = if (seen.isEmpty()) "none" else seen.joinToString(", ")
+                              }
                           }
                       }
                   } catch (e: Exception) { note = "Battery error: " + e.toString().take(120) }

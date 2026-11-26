@@ -39,8 +39,8 @@ jobs:
               applicationId = "com.starmobiles.iphonecheck"
               minSdk = 26
               targetSdk = 34
-              versionCode = 8
-              versionName = "0.8"
+              versionCode = 9
+              versionName = "0.9"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -76,7 +76,17 @@ jobs:
           import android.hardware.usb.*
           import android.os.Build
           import android.os.Bundle
+          import android.app.AlertDialog
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
           import android.util.Base64
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import java.text.SimpleDateFormat
+          import java.util.Locale
           import android.widget.*
           import java.io.ByteArrayOutputStream
           import java.math.BigInteger
@@ -475,6 +485,69 @@ jobs:
               "iPhone17,2" to "iPhone 16 Pro Max", "iPhone17,5" to "iPhone 16e"
           )
 
+          fun valText(v: Element): String {
+              if (v.tagName == "data") {
+                  return try {
+                      val b = Base64.decode(v.textContent, Base64.DEFAULT)
+                      val txt = String(b, Charsets.ISO_8859_1).trim { it.code == 0 || it.isWhitespace() }
+                      if (txt.isNotEmpty() && txt.all { it.code in 32..126 }) txt else b.take(16).joinToString("") { "%02x".format(it) }
+                  } catch (e: Exception) { "(data)" }
+              }
+              return show(v)
+          }
+
+          fun collect(e: Element, out: MutableMap<String, String>, keys: List<String>, depth: Int = 0) {
+              if (depth > 6) return
+              for ((k, v) in kv(e)) {
+                  when (v.tagName) {
+                      "dict" -> collect(v, out, keys, depth + 1)
+                      "array" -> {
+                          val ch = v.childNodes
+                          for (i in 0 until ch.length) {
+                              val c = ch.item(i)
+                              if (c is Element && c.tagName == "dict") collect(c, out, keys, depth + 1)
+                          }
+                      }
+                      else -> if (out.size < 14 && keys.any { k.contains(it, true) }) {
+                          val s = valText(v)
+                          if (s.isNotEmpty() && !s.startsWith("(")) out.putIfAbsent(k, s)
+                      }
+                  }
+              }
+          }
+
+          fun dateIdx(s: String): Int? {
+              val m = Regex("^[A-Z0-9]{3}(\\d)(\\d{2})").find(s) ?: return null
+              return m.groupValues[1].toInt() * 53 + m.groupValues[2].toInt()
+          }
+
+          fun partTag(serial: String, board: String?): String {
+              val a = dateIdx(serial) ?: return ""
+              val b = (if (board == null) null else dateIdx(board)) ?: return ""
+              return if (Math.abs(a - b) <= 26) "OK" else "DIFF"
+          }
+
+          fun partList(rows: Map<String, String>): List<Pair<String, String>> {
+              val out = ArrayList<Pair<String, String>>()
+              fun add(name: String, v: String?) { if (!v.isNullOrBlank() && v != "no serial data") out.add(Pair(name, v)) }
+              add("Battery", rows["batt.Serial"] ?: rows["batt.BatterySerialNumber"])
+              for ((k, v) in rows) {
+                  if (!k.startsWith("part.")) continue
+                  val n = when {
+                      k.contains("SuperWide") -> "Ultra-wide camera"
+                      k.contains("Tele") -> "Telephoto camera"
+                      k.contains("BackCameraModuleSerial") || k.contains("BackWide") -> "Back camera"
+                      k.contains("FrontIRStructured") -> "Face ID projector"
+                      k.contains("FrontIRCamera") -> "Face ID IR camera"
+                      k.contains("FrontCameraModuleSerial") -> "Front camera"
+                      k.contains("CLCD") || k.contains("Framebuffer") -> if (k.contains("erial", true)) "Display" else null
+                      else -> null
+                  }
+                  if (n != null) add(n, v)
+              }
+              return out
+          }
+
           val DESIGN = mapOf(
               "iPhone12,1" to 3110, "iPhone12,3" to 3046, "iPhone12,5" to 3969, "iPhone12,8" to 1821,
               "iPhone13,1" to 2227, "iPhone13,2" to 2815, "iPhone13,3" to 2815, "iPhone13,4" to 3687,
@@ -499,15 +572,25 @@ jobs:
           class MainActivity : Activity() {
               private val PERM = "com.starmobiles.iphonecheck.USB_PERM"
               private lateinit var out: TextView
+              private lateinit var board: LinearLayout
               private lateinit var usb: UsbManager
               @Volatile private var busy = false
               private var info = ""
               private var last = ""
+              private var dark = false
+              private var ur = false
+              @Volatile private var curRows: LinkedHashMap<String, String>? = null
+              private var shown: Map<String, String>? = null
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
               private val rx = object : BroadcastReceiver() {
                   override fun onReceive(c: Context, i: Intent) {
                       if (i.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
-                          if (!busy) out.text = "WARNING: iPhone disconnected. Reconnect the cable and press Scan.\n\n" + last
+                          if (!busy) {
+                              out.visibility = View.VISIBLE
+                              out.text = tr("⚠️ iPhone disconnected. Reconnect the cable and scan again.", "⚠️ آئی فون منقطع ہو گیا۔ کیبل دوبارہ لگائیں اور اسکین کریں۔")
+                          }
                       } else scan()
                   }
               }
@@ -515,18 +598,10 @@ jobs:
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   usb = getSystemService(Context.USB_SERVICE) as UsbManager
-                  val root = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(32, 64, 32, 32)
-                  }
-                  val btn = Button(this).apply {
-                      text = "Scan iPhone"
-                      setOnClickListener { scan() }
-                  }
-                  out = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
-                  root.addView(btn)
-                  root.addView(ScrollView(this).apply { addView(out) })
-                  setContentView(root)
+                  val ui = getSharedPreferences("ui", MODE_PRIVATE)
+                  dark = ui.getBoolean("dark", false)
+                  ur = ui.getBoolean("ur", false)
+                  buildUi()
                   val f = IntentFilter().apply {
                       addAction(PERM)
                       addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
@@ -663,6 +738,13 @@ jobs:
                       val bd = rows["batt.DesignCapacity"]?.toDoubleOrNull()
                       if (exp != null && bd != null && Math.abs(bd - exp) / exp > 0.10) o.add("⚠️ Design capacity differs from normal for this model")
                   }
+                  val pl = partList(rows)
+                  val board = rows["MLBSerialNumber"]
+                  if (pl.size >= 2 && board != null) {
+                      val bad = pl.filter { partTag(it.second, board) == "DIFF" }
+                      if (bad.isEmpty()) o.add("✅ Parts date codes are consistent with the logic board")
+                      else for (p in bad) o.add("⚠️ " + p.first + " date code is far from the logic board (maybe replaced)")
+                  }
                   if (o.isEmpty()) o.add("ℹ️ Not enough data for checks")
                   return o
               }
@@ -729,6 +811,7 @@ jobs:
                   if (!mux.start()) return "usbmux handshake failed.\n" + info + "\n" + mux.dbg
                   if (!mux.open(62078)) return "iPhone info service did not answer.\n" + info + "\n" + mux.dbg
                   val rows = LinkedHashMap<String, String>()
+                  curRows = rows
                   fun addAll(r: String?, prefix: String) {
                       try {
                           val v = valOf(r)
@@ -809,10 +892,9 @@ jobs:
                                           val reg2 = dive(parse(r2).firstOrNull { it.first == "Diagnostics" }?.second, "IORegistry")
                                           if (reg2 != null && kv(reg2).isNotEmpty()) {
                                               seen.add(cls)
-                                              for ((k4, e4) in kv(reg2)) {
-                                                  val v4 = show(e4)
-                                                  if (!v4.startsWith("(") && (k4.contains("serial", true) || k4.contains("module", true))) rows["part." + cls + "." + k4] = v4
-                                              }
+                                              val found = LinkedHashMap<String, String>()
+                                              collect(reg2, found, if (cls.startsWith("AppleH")) listOf("serial", "module") else listOf("serial", "panel", "barcode", "lcd"))
+                                              for ((k4, v4) in found) rows["part." + cls + "." + k4] = v4
                                           }
                                       } catch (e: Exception) { }
                                   }
@@ -827,24 +909,355 @@ jobs:
 
               private fun scan() {
                   if (busy) return
+                  out.visibility = View.VISIBLE
                   val list = usb.deviceList.values.filter { it.vendorId == 0x05AC }
                   if (list.isEmpty()) {
-                      out.text = "No iPhone found.\n\n1. Connect cable\n2. Unlock iPhone\n3. Tap Trust if asked\n4. Press Scan"
+                      out.text = tr("No iPhone found.\n\n1. Connect cable\n2. Unlock iPhone\n3. Tap Trust if asked\n4. Press Scan", "کوئی آئی فون نہیں ملا۔\n\n۱۔ کیبل لگائیں\n۲۔ آئی فون انلاک کریں\n۳۔ Trust دبائیں\n۴۔ اسکین دبائیں")
                       return
                   }
                   val d = list[0]
                   if (!usb.hasPermission(d)) {
                       val pi = PendingIntent.getBroadcast(this, 0, Intent(PERM).setPackage(packageName), PendingIntent.FLAG_MUTABLE)
                       usb.requestPermission(d, pi)
-                      out.text = "Allow USB access on the popup."
+                      out.text = tr("Allow USB access on the popup.", "پاپ اپ پر USB کی اجازت دیں۔")
                       return
                   }
                   busy = true
-                  out.text = "Reading iPhone... keep it unlocked."
+                  shown = null
+                  curRows = null
+                  board.removeAllViews()
+                  out.text = tr("Reading iPhone... keep it unlocked.", "آئی فون پڑھ رہا ہے... اسے انلاک رکھیں۔")
                   Thread {
                       val r = try { query(d) } catch (e: Exception) { "Error: " + e.toString() }
-                      runOnUiThread { out.text = r; last = r; busy = false }
+                      val rr = curRows
+                      runOnUiThread {
+                          last = r
+                          busy = false
+                          if (rr != null && rr["SerialNumber"] != null && rr["ProductType"] != null) {
+                              val snap = LinkedHashMap<String, String>(rr)
+                              render(snap)
+                              saveHistory(snap)
+                          } else {
+                              out.visibility = View.VISIBLE
+                              out.text = r
+                          }
+                      }
                   }.start()
+              }
+
+              // ---------------- dashboard UI ----------------
+
+              private fun tr(en: String, urd: String) = if (ur) urd else en
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun bg() = if (dark) 0xFF0F1626.toInt() else 0xFFF3F6FC.toInt()
+              private fun card() = if (dark) 0xFF1B2540.toInt() else 0xFFFFFFFF.toInt()
+              private fun txt() = if (dark) 0xFFFFFFFF.toInt() else 0xFF1B2540.toInt()
+              private fun sub() = if (dark) 0xFFA9B4D0.toInt() else 0xFF6B7690.toInt()
+
+              private fun box(color: Int, r: Int = 18): GradientDrawable = GradientDrawable().apply {
+                  setColor(color)
+                  cornerRadius = dp(r).toFloat()
+              }
+
+              private fun tv(s: String, size: Float, color: Int, bold: Boolean = false): TextView = TextView(this).apply {
+                  text = s
+                  textSize = size
+                  setTextColor(color)
+                  if (bold) typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private fun lpTop(top: Int) = LinearLayout.LayoutParams(MATCH, WRAP).apply { setMargins(0, dp(top), 0, 0) }
+
+              private fun chip(label: String, click: () -> Unit): TextView = TextView(this).apply {
+                  text = label
+                  textSize = 15f
+                  typeface = Typeface.DEFAULT_BOLD
+                  setTextColor(txt())
+                  background = box(card(), 20)
+                  setPadding(dp(12), dp(8), dp(12), dp(8))
+                  gravity = Gravity.CENTER
+                  layoutParams = LinearLayout.LayoutParams(WRAP, WRAP).apply { setMargins(dp(6), 0, 0, 0) }
+                  setOnClickListener { click() }
+              }
+
+              private fun bigBtn(label: String, color: Int, click: () -> Unit): Button = Button(this).apply {
+                  text = label
+                  setTextColor(Color.WHITE)
+                  typeface = Typeface.DEFAULT_BOLD
+                  textSize = 14f
+                  isAllCaps = false
+                  background = box(color, 24)
+                  setOnClickListener { click() }
+              }
+
+              private fun tile(emoji: String, title: String, accent: Int, big: String?, bigSize: Float, lines: List<Pair<String, String>>, bar: Int? = null): LinearLayout {
+                  val c = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = box(card())
+                      setPadding(dp(14), dp(12), dp(14), dp(14))
+                      elevation = dp(2).toFloat()
+                  }
+                  c.addView(tv(emoji + "  " + title, 15f, accent, true))
+                  if (big != null) c.addView(tv(big, bigSize, accent, true))
+                  if (bar != null) {
+                      val pb = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                      pb.max = 100
+                      pb.progress = bar
+                      pb.progressTintList = ColorStateList.valueOf(accent)
+                      c.addView(pb, LinearLayout.LayoutParams(MATCH, dp(8)).apply { setMargins(0, dp(4), 0, dp(6)) })
+                  }
+                  for ((k, v) in lines) {
+                      c.addView(tv(k, 12f, sub()))
+                      c.addView(tv(v, 15f, txt(), true))
+                  }
+                  return c
+              }
+
+              private fun row2(a: View, b: View): LinearLayout = LinearLayout(this).apply {
+                  orientation = LinearLayout.HORIZONTAL
+                  addView(a, LinearLayout.LayoutParams(0, WRAP, 1f).apply { setMargins(0, 0, dp(5), 0) })
+                  addView(b, LinearLayout.LayoutParams(0, WRAP, 1f).apply { setMargins(dp(5), 0, 0, 0) })
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(bg())
+                      setPadding(dp(14), dp(40), dp(14), dp(10))
+                  }
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  bar.addView(tv("STAR iPhone Checker", 20f, txt(), true), LinearLayout.LayoutParams(0, WRAP, 1f))
+                  bar.addView(chip(if (dark) "☀️" else "🌙") {
+                      dark = !dark
+                      getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("dark", dark).apply()
+                      buildUi()
+                  })
+                  bar.addView(chip(if (ur) "EN" else "اردو") {
+                      ur = !ur
+                      getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("ur", ur).apply()
+                      buildUi()
+                  })
+                  bar.addView(chip("📜") { showHistory() })
+                  root.addView(bar)
+                  val scanBtn = Button(this).apply {
+                      text = tr("Scan iPhone", "آئی فون اسکین کریں")
+                      setTextColor(Color.WHITE)
+                      typeface = Typeface.DEFAULT_BOLD
+                      textSize = 17f
+                      isAllCaps = false
+                      background = box(0xFF3B82F6.toInt(), 28)
+                      setOnClickListener { scan() }
+                  }
+                  root.addView(scanBtn, LinearLayout.LayoutParams(MATCH, dp(56)).apply { setMargins(0, dp(12), 0, dp(6)) })
+                  out = tv("", 14f, sub())
+                  out.setTextIsSelectable(true)
+                  out.visibility = View.GONE
+                  root.addView(out)
+                  board = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(ScrollView(this).apply { addView(board) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                  setContentView(root)
+                  val r = shown
+                  if (r != null) render(r) else showWelcome()
+              }
+
+              private fun showWelcome() {
+                  board.removeAllViews()
+                  board.addView(tile("📱", tr("Ready", "تیار"), 0xFF3B82F6.toInt(), null, 20f, listOf(
+                      tr("How to use", "استعمال") to tr(
+                          "Connect the iPhone with the cable, unlock it, then tap Scan iPhone. Tap Trust on the iPhone if asked.",
+                          "آئی فون کو کیبل سے لگائیں، انلاک کریں، پھر اسکین دبائیں۔ اگر پوچھے تو آئی فون پر Trust دبائیں۔"
+                      )
+                  )), lpTop(14))
+              }
+
+              private fun score(rows: Map<String, String>): Int {
+                  var s = 100
+                  for (c in checks(rows)) {
+                      if (c.startsWith("❌")) s -= 35 else if (c.startsWith("⚠️")) s -= 8
+                  }
+                  val hp = battHealth(rows)
+                  if (hp != null && hp < 90) s -= ((90 - hp) / 2).toInt()
+                  return s.coerceIn(0, 100)
+              }
+
+              private fun report(rows: Map<String, String>): String {
+                  val sb = StringBuilder()
+                  val pt = rows["ProductType"]
+                  sb.append("STAR Mobiles - iPhone Check Report\n")
+                  sb.append(SimpleDateFormat("dd MMM yyyy HH:mm", Locale.US).format(Date())).append("\n\n")
+                  sb.append(MODELS[pt] ?: pt ?: "iPhone").append("\n")
+                  fun l(k: String, v: String?) { if (v != null) sb.append(k).append(": ").append(v).append("\n") }
+                  l("iOS", rows["ProductVersion"])
+                  l("Storage", gbs(rows["disk.TotalDiskCapacity"]))
+                  l("Serial", rows["SerialNumber"])
+                  l("IMEI", rows["InternationalMobileEquipmentIdentity"])
+                  l("IMEI 2", rows["InternationalMobileEquipmentIdentity2"])
+                  l("Model no", rows["ModelNumber"])
+                  l("Region", rows["RegionInfo"])
+                  l("Activation", rows["ActivationState"])
+                  l("Find My", rows["fmip"]?.let { if (it == "Yes") "ON" else "OFF" })
+                  val hp = battHealth(rows)
+                  l("Battery health", hp?.let { String.format("%.0f%%", it) })
+                  l("Charge cycles", rows["batt.CycleCount"])
+                  sb.append("\nChecks:\n")
+                  for (c in checks(rows)) sb.append(c).append("\n")
+                  val pl = partList(rows)
+                  if (pl.isNotEmpty()) {
+                      sb.append("\nParts:\n")
+                      for ((n, s) in pl) sb.append(n).append(": ").append(s).append("\n")
+                  }
+                  sb.append("\nScore: ").append(score(rows)).append("/100\n")
+                  return sb.toString()
+              }
+
+              private fun saveHistory(rows: Map<String, String>) {
+                  val pt = rows["ProductType"]
+                  val line = SimpleDateFormat("dd MMM HH:mm", Locale.US).format(Date()) + " | " + (MODELS[pt] ?: pt ?: "iPhone") +
+                      " | " + (rows["SerialNumber"] ?: "?") + " | " + score(rows) + "/100"
+                  val sp = getSharedPreferences("hist", MODE_PRIVATE)
+                  val old = (sp.getString("items", "") ?: "").split("\n").filter { it.isNotBlank() }
+                  sp.edit().putString("items", (listOf(line) + old).take(80).joinToString("\n")).apply()
+              }
+
+              private fun showHistory() {
+                  val sp = getSharedPreferences("hist", MODE_PRIVATE)
+                  val items = sp.getString("items", "") ?: ""
+                  AlertDialog.Builder(this)
+                      .setTitle(tr("History", "ہسٹری"))
+                      .setMessage(if (items.isBlank()) tr("No scans yet", "ابھی کوئی اسکین نہیں") else items)
+                      .setPositiveButton("OK", null)
+                      .setNegativeButton(tr("Clear", "صاف کریں")) { _, _ -> sp.edit().clear().apply() }
+                      .show()
+              }
+
+              private fun share(rows: Map<String, String>) {
+                  val i = Intent(Intent.ACTION_SEND).apply {
+                      type = "text/plain"
+                      putExtra(Intent.EXTRA_TEXT, report(rows))
+                  }
+                  startActivity(Intent.createChooser(i, "Share report"))
+              }
+
+              private fun render(rows: Map<String, String>) {
+                  shown = rows
+                  out.visibility = View.GONE
+                  board.removeAllViews()
+                  val green = 0xFF1DB954.toInt()
+                  val orange = 0xFFFF9F1C.toInt()
+                  val red = 0xFFE5383B.toInt()
+                  val blue = 0xFF3B82F6.toInt()
+                  val purple = 0xFF8B5CF6.toInt()
+                  val teal = 0xFF14B8A6.toInt()
+                  val pink = 0xFFEC4899.toInt()
+                  val pt = rows["ProductType"]
+                  val model = MODELS[pt] ?: (pt ?: "iPhone")
+                  val hp = battHealth(rows)
+                  val sc = score(rows)
+                  val scColor = if (sc >= 85) green else if (sc >= 70) orange else red
+                  val verdict = if (sc >= 85) tr("Excellent", "بہترین") else if (sc >= 70) tr("Good", "اچھا") else if (sc >= 50) tr("Check carefully", "احتیاط سے دیکھیں") else tr("Risky", "خطرناک")
+
+                  val head = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      background = box(card())
+                      setPadding(dp(16), dp(14), dp(16), dp(14))
+                      elevation = dp(2).toFloat()
+                  }
+                  val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  left.addView(tv("📱 " + model, 22f, txt(), true))
+                  left.addView(tv("iOS " + (rows["ProductVersion"] ?: "?") + "  •  " + (gbs(rows["disk.TotalDiskCapacity"]) ?: "?"), 14f, sub()))
+                  left.addView(tv(tr("Score", "اسکور") + ": " + verdict, 16f, scColor, true))
+                  head.addView(left, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  val ring = TextView(this).apply {
+                      text = sc.toString()
+                      textSize = 28f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(scColor)
+                      }
+                  }
+                  head.addView(ring, LinearLayout.LayoutParams(dp(84), dp(84)))
+                  board.addView(head, lpTop(8))
+
+                  val bcol = if (hp == null) blue else if (hp >= 85) green else if (hp >= 75) orange else red
+                  val bd = rows["batt.DesignCapacity"]?.toDoubleOrNull()
+                  val bn = (rows["batt.NominalChargeCapacity"] ?: rows["batt.AppleRawMaxCapacity"])?.toDoubleOrNull()
+                  val cap = if (bd != null && bn != null) String.format("%.0f / %.0f mAh", bn, bd) else "N/A"
+                  val battTile = tile("🔋", tr("Battery", "بیٹری"), bcol, if (hp != null) String.format("%.0f%%", hp) else "N/A", 32f, listOf(
+                      tr("Charge cycles", "سائیکل") to (rows["batt.CycleCount"] ?: "N/A"),
+                      tr("Capacity", "گنجائش") to cap,
+                      tr("Temperature", "درجہ حرارت") to (rows["batt.Temperature"]?.toDoubleOrNull()?.let { String.format("%.1f °C", it / 100) } ?: "N/A")
+                  ))
+                  val fm = rows["fmip"]
+                  val fmTile = tile("🔐", "iCloud / Find My", if (fm == "Yes") red else if (fm == null) blue else green,
+                      if (fm == "Yes") "ON" else if (fm == null) "N/A" else "OFF", 32f, listOf(
+                          tr("Activation", "ایکٹیویشن") to (rows["ActivationState"] ?: "N/A"),
+                          tr("Passcode", "پاس کوڈ") to (rows["PasswordProtected"] ?: "N/A")
+                      ))
+                  board.addView(row2(battTile, fmTile), lpTop(10))
+
+                  val total = rows["disk.TotalDiskCapacity"]?.toDoubleOrNull()
+                  val free = rows["disk.AmountDataAvailable"]?.toDoubleOrNull()
+                  val usedPct = if (total != null && free != null && total > 0) (100 - free / total * 100).toInt().coerceIn(0, 100) else null
+                  val storTile = tile("💾", tr("Storage", "سٹوریج"), purple, gbs(rows["disk.TotalDiskCapacity"]) ?: "N/A", 26f, listOf(
+                      tr("Free", "خالی") to (gbs(rows["disk.AmountDataAvailable"]) ?: "N/A")
+                  ), usedPct)
+                  val simTile = tile("📶", "SIM", teal, null, 20f, listOf(
+                      "SIM" to (rows["SIMStatus"]?.removePrefix("kCTSIMSupportSIMStatus") ?: "N/A"),
+                      tr("Carrier code", "کیریئر کوڈ") to ((rows["MobileSubscriberCountryCode"] ?: "?") + "-" + (rows["MobileSubscriberNetworkCode"] ?: "?"))
+                  ))
+                  board.addView(row2(storTile, simTile), lpTop(10))
+
+                  board.addView(tile("🔢", tr("Identity", "شناخت"), blue, null, 20f, listOf(
+                      tr("Serial", "سیریل") to (rows["SerialNumber"] ?: "N/A"),
+                      "IMEI" to (rows["InternationalMobileEquipmentIdentity"] ?: "N/A"),
+                      "IMEI 2" to (rows["InternationalMobileEquipmentIdentity2"] ?: "N/A"),
+                      tr("Model no", "ماڈل نمبر") to (rows["ModelNumber"] ?: "N/A"),
+                      tr("Region", "علاقہ") to (rows["RegionInfo"] ?: "N/A")
+                  )), lpTop(10))
+
+                  val board0 = rows["MLBSerialNumber"]
+                  val pl = partList(rows)
+                  val partLines = ArrayList<Pair<String, String>>()
+                  if (board0 != null) partLines.add(tr("Logic board", "مدر بورڈ") to board0)
+                  for ((n, s) in pl) {
+                      val tg = partTag(s, board0)
+                      partLines.add(n to (s + (if (tg == "OK") "  ✓" else if (tg == "DIFF") "  ⚠️" else "")))
+                  }
+                  if (partLines.isEmpty()) partLines.add(tr("Parts", "پرزے") to tr("No part serials available", "پرزوں کے سیریل دستیاب نہیں"))
+                  board.addView(tile("🧩", tr("Parts", "پرزے"), pink, null, 20f, partLines), lpTop(10))
+
+                  val chk = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = box(card())
+                      setPadding(dp(14), dp(12), dp(14), dp(14))
+                      elevation = dp(2).toFloat()
+                  }
+                  chk.addView(tv("✅  " + tr("Checks", "جانچ"), 15f, green, true))
+                  for (c in checks(rows)) {
+                      val col = if (c.startsWith("❌")) red else if (c.startsWith("⚠️")) orange else txt()
+                      chk.addView(tv(c, 14f, col, true), lpTop(6))
+                  }
+                  board.addView(chk, lpTop(10))
+
+                  val raw = tv(if (last.isNotEmpty()) last else fmt(rows), 12f, sub())
+                  raw.setTextIsSelectable(true)
+                  raw.visibility = View.GONE
+                  val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  btnRow.addView(bigBtn("📤  " + tr("Share report", "رپورٹ شیئر کریں"), 0xFF25D366.toInt()) { share(rows) },
+                      LinearLayout.LayoutParams(0, dp(52), 1f).apply { setMargins(0, 0, dp(5), 0) })
+                  btnRow.addView(bigBtn("📋  " + tr("Full details", "مکمل تفصیل"), 0xFF6366F1.toInt()) {
+                      raw.visibility = if (raw.visibility == View.GONE) View.VISIBLE else View.GONE
+                  }, LinearLayout.LayoutParams(0, dp(52), 1f).apply { setMargins(dp(5), 0, 0, 0) })
+                  board.addView(btnRow, lpTop(12))
+                  board.addView(raw, lpTop(10))
+                  board.addView(View(this), LinearLayout.LayoutParams(MATCH, dp(24)))
               }
           }
           EOF
